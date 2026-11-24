@@ -1,7 +1,7 @@
 # Réponses — TP Migrer StayBook vers Kubernetes avec Argo CD
 
-**Nom(s) :**  
-**Dépôt GitHub :**  
+**Nom(s) :** Martin Mixte  
+**Dépôt GitHub :** https://github.com/zebaxter/staybook-gitops  
 
 
 ## Étape 1 — Docker Compose : le point de départ
@@ -12,12 +12,31 @@ _Dans ce `docker-compose.yml`, repérez tout ce que Compose fait **pour vous** e
 
 Réponse :
 
+Ce que Compose fait pour nous dans `docker-compose.yml`, et que Kubernetes ne fera pas tout seul :
+
+| Ce que fait Compose | Mot-clé Compose |
+|---|---|
+| Ordre de démarrage | `depends_on` (forme courte : liste de services) |
+| Attendre qu'un service soit **prêt**, pas seulement démarré | `depends_on` + `condition: service_healthy`, avec un `healthcheck` (`pg_isready`) |
+| Réseau privé et DNS entre conteneurs (on s'appelle par le nom du service : `postgres-hotels`, `hotels-service:3001`…) | `networks: [tp]` + le bloc `networks:` (`driver: bridge`) |
+| Persistance des données (bases, Qdrant, modèles Ollama) | `volumes:` (volumes nommés `hotels-data`, `ollama-data`…) et bind-mount des scripts SQL d'init |
+| Exposer le site sur la machine | `ports: - "8080:80"` (seul le `front` est exposé) |
+| Variables d'environnement | `environment:`, plus `${EMBED_MODEL}` / `${LLM_MODEL}` lus dans le fichier `.env` |
+| Construction des images depuis notre code | `build: ./hotels-service` (etc.) ; `image:` pour les images toutes faites |
+
+Vérification : `docker compose up -d --build` lance les 9 conteneurs. http://localhost:8080 affiche les 6 hôtels, et le concierge répond (« Je cherche un hotel a Paris pour 2 personnes ») une fois les modèles `nomic-embed-text` et `llama3.2:1b` téléchargés et les 6 hôtels indexés.
+
 
 ### Question 2
 
 _Pourquoi faut-il impérativement faire `docker compose down` avant de continuer ? (Deux raisons : l'une concerne un port, l'autre la mémoire.)_
 
 Réponse :
+
+1. **Le port** : le front Compose publie `8080:80` sur la machine. Or le cluster kind utilise aussi le port **8080** de la machine (redirigé vers le NodePort 30080 d'Argo CD). Deux programmes ne peuvent pas écouter sur le même port : la création du cluster échouerait (`address already in use`), ou Argo CD serait inaccessible. Pour le TP, j'ai d'ailleurs dû arrêter le nœud kind (`docker stop argocd-tp-control-plane`) pour pouvoir relancer Compose.
+2. **La mémoire** : les 9 conteneurs, surtout **Ollama** avec son modèle Llama chargé en RAM (plus Qdrant et 2 PostgreSQL), consomment plusieurs Go. Le cluster kind va relancer **les mêmes services** (dont un deuxième Ollama), plus Argo CD et Kubernetes lui-même. Avec les ~8 Go alloués à Docker, les deux ensemble saturent la mémoire : pods `OOMKilled` ou `Pending`.
+
+`docker compose down` supprime les conteneurs et le réseau mais **garde les images** (`docker images | grep staybook` les liste toujours) et les volumes nommés (sans `-v`).
 
 
 ## Étape 2 — Kubernetes + Argo CD : la migration
@@ -28,6 +47,12 @@ _En mode push, qui détient les droits d'administration sur le cluster ? Citez d
 
 Réponse :
 
+En mode **push**, c'est l'outil de déploiement (le pipeline CI : GitLab CI, GitHub Actions, Jenkins), et donc toute personne ou tout script qui contrôle ce pipeline, qui détient un **kubeconfig administrateur** du cluster, stocké comme secret dans la CI.
+
+Deux risques concrets que le modèle **pull** réduit :
+1. **Fuite des identifiants** : si la CI est compromise (dépendance malveillante, secret affiché dans un log, runner partagé), l'attaquant obtient un accès admin au cluster de production. En pull, la CI n'a aucun accès au cluster : c'est l'agent (Argo CD), **dans** le cluster, qui va lire Git. Il n'y a aucun port à ouvrir vers le cluster ni de credentials cluster à l'extérieur.
+2. **Dérive non détectée** : en push, on applique une fois puis plus personne ne compare. Une modification manuelle (`kubectl edit`) ou un déploiement raté reste invisible. En pull, l'agent compare **en continu** l'état réel à Git et corrige ou signale l'écart. On a aussi une seule porte d'entrée, Git, donc tout changement est tracé (qui, quoi, quand) et réversible (`git revert`).
+
 
 ### Question 4
 
@@ -35,12 +60,29 @@ _Un collègue modifie « à la main » le nombre de réplicas d'un déploiement 
 
 Réponse :
 
+D'après le principe 4 (**réconcilié en continu**), Argo CD compare en permanence le cluster à Git. Le `kubectl scale` crée une **dérive** : l'Application passe `OutOfSync`. Si le **self-heal** est activé, Argo CD remet presque immédiatement le nombre de réplicas écrit dans Git, et la modification du collègue est annulée. Sans self-heal, l'application reste `OutOfSync` jusqu'au prochain sync, qui l'écrasera.
+
+C'est **souhaitable** : Git reste la seule source de vérité. Une modification non tracée, non relue et non reproductible ne doit pas survivre. Si le collègue a vraiment besoin de 3 réplicas, il doit faire un commit (et une revue). En cas d'urgence, on peut suspendre l'auto-sync, mais c'est une décision explicite, pas un contournement silencieux. (Constaté en pratique à la question 29.)
+
 
 ### Question 5
 
 _Quel composant est le seul à parler à GitHub ? Lequel est le seul à créer des ressources dans le cluster ?_
 
 Réponse :
+
+| Composant | Rôle (une phrase) | Deployment ou StatefulSet ? |
+|---|---|---|
+| argocd-server | API (gRPC/REST) et interface web ; c'est à lui que parlent le navigateur et la CLI `argocd`. | Deployment |
+| argocd-repo-server | Clone les dépôts Git et génère les manifests (YAML brut, Kustomize, Helm) ; garde un cache. | Deployment |
+| argocd-application-controller | Compare en continu l'état voulu (manifests générés) à l'état réel du cluster et synchronise : applique, prune, self-heal. | **StatefulSet** |
+| argocd-redis | Cache partagé (manifests générés, état de l'application) entre les composants. | Deployment |
+| argocd-dex-server | Fournisseur d'identité (OIDC) pour le SSO : connexion via GitHub, LDAP, SAML… | Deployment |
+| argocd-applicationset-controller | Génère automatiquement des Applications à partir de modèles (ApplicationSet : liste, dossiers Git, clusters…). | Deployment |
+| argocd-notifications-controller | Envoie des notifications (Slack, e-mail, webhook…) sur les événements des Applications. | Deployment |
+
+- Le seul composant qui **parle à GitHub** est **`argocd-repo-server`** : il clone et lit les dépôts.
+- Le seul qui **crée des ressources dans le cluster** est **`argocd-application-controller`** : il applique les manifests que lui fournit le repo-server. L'`argocd-server` ne fait que transmettre les demandes, par exemple un sync manuel.
 
 
 ### Question 6
